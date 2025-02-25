@@ -1,0 +1,159 @@
+
+```python
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import matplotlib.pyplot as plt
+from scipy.stats import ecdf
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import scale
+from sklearn.metrics import silhouette_score
+import seaborn as sns
+from statsmodels.nonparametric.smoothers_lowess import lowess
+from scipy.stats import gaussian_kde
+
+# Assuming med.events is a DataFrame loaded from a CSV or other source
+ExamplePats = med_events
+tidy = ExamplePats
+tidy.columns = ["pnr", "eksd", "perday", "ATC", "dur_original"]
+tidy['eksd'] = pd.to_datetime(tidy['eksd'], format='%m/%d/%Y')
+
+arg1 = "medA"
+
+def See(arg1):
+    C09CA01 = tidy[tidy['ATC'] == arg1]
+    # Take a random sequence of consecutive prescription in the dataset
+    Drug_see_p0 = C09CA01
+    Drug_see_p1 = C09CA01
+    Drug_see_p1 = Drug_see_p1.sort_values(by=['pnr', 'eksd']).groupby('pnr').apply(lambda x: x.assign(prev_eksd=x['eksd'].shift(1)))
+    Drug_see_p1 = Drug_see_p1.dropna(subset=['prev_eksd'])
+    Drug_see_p1 = Drug_see_p1.groupby('pnr').apply(lambda x: x.sample(n=1)).reset_index(drop=True)
+    Drug_see_p1 = Drug_see_p1[['pnr', 'eksd', 'prev_eksd']]  # only use the needed columns
+    Drug_see_p1['event.interval'] = (Drug_see_p1['eksd'] - Drug_see_p1['prev_eksd']).dt.days
+    Drug_see_p1['event.interval'] = Drug_see_p1['event.interval'].astype(float)
+    per = ecdf(Drug_see_p1['event.interval'])  # Generate the empirical cumulative distribution plot
+    x = per.x
+    ecdfs = [ecdf(Drug_see_p1['event.interval']) for _ in range(1)]  # generating difference "cuts" of the original empirical cumulative distributions
+    y = [e(Drug_see_p1['event.interval']) for e in ecdfs]
+    y = np.array(y).flatten()
+    x = np.array(x).flatten()
+    x = x.astype(float)
+    dfper = pd.DataFrame({'x': x, 'y': y})
+
+    # Retain the 20% of the ECDF
+    dfper = dfper[dfper['y'] <= 0.8]  # Remove the upper 20%? Should this be >=0.8?
+    max_x = dfper['x'].max()
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.plot(dfper['x'], dfper['y'], label="80% ECDF")
+    plt.title("80% ECDF")
+    plt.subplot(1, 2, 2)
+    plt.plot(x, y, label="100% ECDF")
+    plt.title("100% ECDF")
+    plt.show()
+
+    m1 = Drug_see_p1['pnr'].value_counts()
+    plt.figure()
+    m1.plot(kind='bar')
+    plt.show()
+
+    ni = max(dfper['x'])
+    Drug_see_p2 = Drug_see_p1[Drug_see_p1['event.interval'] <= ni]
+    d = gaussian_kde(np.log(Drug_see_p2['event.interval'].astype(float)))
+    x1 = np.linspace(min(np.log(Drug_see_p2['event.interval'].astype(float))), max(np.log(Drug_see_p2['event.interval'].astype(float))), 100)
+    y1 = d(x1)
+    plt.figure()
+    plt.plot(x1, y1)
+    plt.title("Log(event interval)")
+    plt.show()
+
+    a = pd.DataFrame({'x': x1, 'y': y1})
+    a = scale(a)
+
+    # Silhouette Score
+    np.random.seed(1234)  # for reproducibility
+    silhouette_scores = []
+    for k in range(2, 11):
+        kmeans = KMeans(n_clusters=k)
+        kmeans.fit(a)
+        score = silhouette_score(a, kmeans.labels_)
+        silhouette_scores.append(score)
+
+    max_cluster = np.argmax(silhouette_scores) + 2
+
+    # K-means Clustering
+    np.random.seed(1234)
+    kmeans = KMeans(n_clusters=max_cluster)
+    dfper['cluster'] = kmeans.fit_predict(dfper[['x']])
+    cluster_summary = dfper.groupby('cluster')['x'].apply(lambda x: np.log(x)).describe()
+    ni2 = dfper.groupby('cluster')['x'].apply(lambda x: np.log(x)).min().reset_index()
+    ni2.columns = ['Cluster', 'Results']
+    ni2['Results'] = np.where(np.isinf(ni2['Results']) & (ni2['Results'] < 0), 0, ni2['Results'])
+    ni3 = dfper.groupby('cluster')['x'].apply(lambda x: np.log(x)).max().reset_index()
+    ni3.columns = ['Cluster', 'Results']
+    ni3['Results'] = ni3['Results'].astype(float)
+    nif = pd.concat([ni2, ni3], axis=1)
+    nif = nif.iloc[:, [0, 1, 3]]
+    nif['Results'] = np.exp(nif['Results'])  # Perform normal exponential since this was logged
+    nif['Results.1'] = np.exp(nif['Results.1'])
+    ni4 = dfper.groupby('cluster')['x'].apply(lambda x: np.log(x)).median(skipna=True).reset_index()
+    ni4.columns = ['Cluster', 'Results']
+    nif = pd.merge(nif, ni4, on='Cluster')
+    nif.columns = ['Cluster', 'Minimum', 'Maximum', 'Median']
+    nif['Median'] = np.where(np.isinf(nif['Median']) & (nif['Median'] < 0), 0, nif['Median'])
+    nif = nif[nif['Median'] > 0]
+    results = Drug_see_p1.merge(nif, how='cross').assign(
+        Final_cluster=lambda x: np.where((x['event.interval'] >= x['Minimum']) & (x['event.interval'] <= x['Maximum']), x['Cluster'], np.nan))
+    results = results.dropna(subset=['Final_cluster'])
+    results['Median'] = np.exp(results['Median'])
+    results = results[['pnr', 'Median', 'Cluster']]
+    t1 = results['Cluster'].value_counts().reset_index()
+    t1.columns = ['Cluster', 'Freq']
+    t1 = t1.sort_values(by='Freq', ascending=False)
+    t1 = t1.iloc[0, 0]
+    t1 = pd.DataFrame({'Cluster': [t1]})
+    t1['Cluster'] = t1['Cluster'].astype(int)
+    results['Cluster'] = results['Cluster'].astype(int)
+    t1_merged = pd.merge(t1, results, on='Cluster')
+    t1_merged = t1_merged.iloc[0]
+    t1_merged = t1_merged.drop(columns=['Freq'])
+    t1 = t1_merged
+    Drug_see_p1 = pd.merge(Drug_see_p1, results, on='pnr', how='left')
+    Drug_see_p1['Median'] = Drug_see_p1['Median'].fillna(t1['Median'])
+    Drug_see_p1['Cluster'] = Drug_see_p1['Cluster'].fillna("0")
+    Drug_see_p1['event.interval'] = Drug_see_p1['event.interval'].astype(float)
+    Drug_see_p1['test'] = np.round(Drug_see_p1['event.interval'] - Drug_see_p1['Median'], 1)
+
+    Drug_see_p3 = Drug_see_p1[['pnr', 'Median', 'Cluster']]
+
+    # Assign Duration
+    Drug_see_p0 = pd.merge(Drug_see_p0, Drug_see_p3, on='pnr', how='left')
+    Drug_see_p0['Median'] = Drug_see_p0['Median'].fillna(t1['Median'])
+    Drug_see_p0['Cluster'] = Drug_see_p0['Cluster'].fillna(0)
+
+    return Drug_see_p0
+
+def see_assumption(arg1):
+    arg1 = arg1.sort_values(by=['pnr', 'eksd']).groupby('pnr').apply(lambda x: x.assign(prev_eksd=x['eksd'].shift(1)))
+    Drug_see2 = arg1.groupby('pnr').apply(lambda x: x.assign(p_number=range(1, len(x) + 1)))
+    Drug_see2 = Drug_see2[Drug_see2['p_number'] >= 2]
+    Drug_see2 = Drug_see2[['pnr', 'eksd', 'prev_eksd', 'p_number']]
+    Drug_see2['Duration'] = (Drug_see2['eksd'] - Drug_see2['prev_eksd']).dt.days
+    Drug_see2['p_number'] = Drug_see2['p_number'].astype('category')
+    pp = sns.boxplot(x='p_number', y='Duration', data=Drug_see2)
+    plt.show()
+
+    medians_of_medians = Drug_see2.groupby('pnr')['Duration'].median().reset_index()
+
+    pp = sns.boxplot(x='p_number', y='Duration', data=Drug_see2)
+    plt.axhline(y=medians_of_medians['Duration'].median(), ls='--', color='red')  # Horizontal line
+    plt.show()
+    return pp
+
+medA = See("medA")
+medB = See("medB")
+
+see_assumption(medA)
+see_assumption(medB)
+```
+
